@@ -1,0 +1,36 @@
+name: Appellate Opinion Scraper
+
+on:
+  schedule:
+    # 9:15 AM US Eastern (EST = UTC-5, so 14:15 UTC)
+    # During EDT (Mar-Nov), this fires at 10:15 AM local time.
+    # Adjust to '15 13 * * *' during daylight saving if needed.
+    - cron: '15 14 * * *'
+
+  workflow_dispatch:
+    # Allows manual triggering from the GitHub Actions tab
+
+jobs:
+  scrape-and-notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          PERSONAL_EMAIL: ${{ secrets.PERSONAL_EMAIL }}
+          PERSONAL_EMAIL_PASSWORD: ${{ secrets.PERSONAL_EMAIL_PASSWORD }}
+          WEBSITES_TO_SCRAPE: ${{ vars.WEBSITES_TO_SCRAPE }}
+          TRIGGER_WORD: ${{ vars.TRIGGER_WORD }}
+          RECIPIENT_LIST: ${{ vars.RECIPIENT_LIST }}
+        run: python scraper.py
