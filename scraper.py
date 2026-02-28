@@ -7,6 +7,7 @@ notifications to a list of recipients when matches are found.
 """
 
 import os
+import re
 import sys
 import ssl
 import smtplib
@@ -63,9 +64,9 @@ def get_config():
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         sys.exit(1)
 
-    websites = [url.strip() for url in websites_raw.split(",") if url.strip()]
-    trigger_words = [word.strip() for word in triggers_raw.split(",") if word.strip()]
-    recipients = [addr.strip() for addr in recipients_raw.split(",") if addr.strip()]
+    websites = [v.strip() for v in re.split(r"[,\n]+", websites_raw) if v.strip()]
+    trigger_words = [v.strip() for v in re.split(r"[,\n]+", triggers_raw) if v.strip()]
+    recipients = [v.strip() for v in re.split(r"[,\n]+", recipients_raw) if v.strip()]
 
     return {
         "email": email,
