@@ -4,6 +4,7 @@ Appellate Opinion Notification Tool
 
 Scrapes configured websites for trigger words — including content loaded
 inside iframes — and sends email notifications when matches are found.
+Matching case captions are included as hyperlinks to the full opinion.
 """
 
 import os
@@ -78,7 +79,7 @@ def get_config():
 
 
 def fetch_page(url):
-    """Fetch a single URL and return the parsed BeautifulSoup and raw text."""
+    """Fetch a URL and return the parsed BeautifulSoup tree."""
     response = requests.get(
         url,
         timeout=REQUEST_TIMEOUT,
@@ -95,34 +96,56 @@ def extract_text(soup):
     return soup.get_text(separator=" ", strip=True)
 
 
+def extract_links(soup, base_url):
+    """Extract all (caption, absolute_url) pairs from <a> tags."""
+    links = []
+    for a_tag in soup.find_all("a", href=True):
+        caption = a_tag.get_text(strip=True)
+        href = urljoin(base_url, a_tag["href"])
+        if caption:
+            links.append({"caption": caption, "url": href})
+    return links
+
+
 def scrape_website(url, depth=0):
     """
-    Fetch a page, extract its text, and recursively follow iframes
-    (up to 2 levels deep) to capture all embedded content.
+    Fetch a page, extract its text and links, and recursively follow
+    iframes (up to 2 levels deep) to capture all embedded content.
+
+    Returns a dict with 'text' (str) and 'links' (list of caption/url dicts),
+    or None on failure.
     """
     if depth > 2:
-        return ""
+        return {"text": "", "links": []}
 
     logger.info("Scraping: %s", url)
     try:
         soup = fetch_page(url)
 
         iframe_texts = []
+        iframe_links = []
         for iframe in soup.find_all("iframe"):
             src = iframe.get("src", "").strip()
             if not src:
                 continue
             iframe_url = urljoin(url, src)
             logger.info("  Found iframe → %s", iframe_url)
-            iframe_text = scrape_website(iframe_url, depth=depth + 1)
-            if iframe_text:
-                iframe_texts.append(iframe_text)
+            result = scrape_website(iframe_url, depth=depth + 1)
+            if result:
+                iframe_texts.append(result["text"])
+                iframe_links.extend(result["links"])
 
         page_text = extract_text(soup)
-        all_text = "\n".join([page_text] + iframe_texts)
+        page_links = extract_links(soup, url)
 
-        logger.info("Extracted %d characters from %s (depth=%d)", len(all_text), url, depth)
-        return all_text
+        all_text = "\n".join([page_text] + iframe_texts)
+        all_links = page_links + iframe_links
+
+        logger.info(
+            "Extracted %d characters, %d links from %s (depth=%d)",
+            len(all_text), len(all_links), url, depth,
+        )
+        return {"text": all_text, "links": all_links}
 
     except requests.RequestException as e:
         logger.error("Failed to scrape %s: %s", url, e)
@@ -137,8 +160,29 @@ def search_for_triggers(text, trigger_words):
     return [word for word in trigger_words if word.lower() in text_lower]
 
 
+def find_matching_links(links, trigger_words):
+    """
+    Find links whose caption contains any trigger word.
+    Returns a list of dicts: {caption, url, matched_triggers}.
+    """
+    matching = []
+    for link in links:
+        caption_lower = link["caption"].lower()
+        matched = [w for w in trigger_words if w.lower() in caption_lower]
+        if matched:
+            matching.append({
+                "caption": link["caption"],
+                "url": link["url"],
+                "matched_triggers": matched,
+            })
+    return matching
+
+
 def build_email_body(results):
-    """Build an HTML email body summarizing all matches found."""
+    """
+    Build an HTML email body. For each site with matches, list the
+    trigger words found and the matching case captions as hyperlinks.
+    """
     timestamp = datetime.now().strftime("%B %d, %Y at %I:%M %p")
 
     html_parts = [
@@ -147,17 +191,28 @@ def build_email_body(results):
         f"<p>The following trigger words were detected during the scan on <strong>{timestamp}</strong>:</p>",
     ]
 
-    for url, matched_words in results.items():
+    for url, match_info in results.items():
         domain = urlparse(url).netloc or url
         html_parts.append(f'<h3><a href="{url}">{domain}</a></h3>')
-        html_parts.append("<ul>")
-        for word in matched_words:
-            html_parts.append(f"<li><strong>{word}</strong></li>")
-        html_parts.append("</ul>")
+
+        html_parts.append("<p><strong>Trigger words found:</strong> "
+                          + ", ".join(match_info["trigger_words"]) + "</p>")
+
+        if match_info["matching_links"]:
+            html_parts.append("<p><strong>Matching case captions:</strong></p>")
+            html_parts.append("<ul>")
+            for link in match_info["matching_links"]:
+                triggers_str = ", ".join(link["matched_triggers"])
+                html_parts.append(
+                    f'<li><a href="{link["url"]}">{link["caption"]}</a>'
+                    f' &mdash; matched: <em>{triggers_str}</em></li>'
+                )
+            html_parts.append("</ul>")
 
     html_parts.extend([
         "<hr>",
-        "<p style='color: #666; font-size: 12px;'>This is an automated notification from the Appellate Opinion Notification tool.</p>",
+        "<p style='color: #666; font-size: 12px;'>This is an automated notification "
+        "from the Appellate Opinion Notification tool.</p>",
         "</body></html>",
     ])
 
@@ -204,18 +259,25 @@ def run():
     all_matches = {}
 
     for url in config["websites"]:
-        text = scrape_website(url)
-        if not text:
+        result = scrape_website(url)
+        if not result:
             continue
-        matched = search_for_triggers(text, config["trigger_words"])
-        if matched:
-            logger.info("MATCH on %s — trigger(s): %s", url, ", ".join(matched))
-            all_matches[url] = matched
+
+        matched_words = search_for_triggers(result["text"], config["trigger_words"])
+        if matched_words:
+            matching_links = find_matching_links(result["links"], config["trigger_words"])
+            logger.info("MATCH on %s — trigger(s): %s", url, ", ".join(matched_words))
+            for link in matching_links:
+                logger.info("  Caption: %s → %s", link["caption"], link["url"])
+            all_matches[url] = {
+                "trigger_words": matched_words,
+                "matching_links": matching_links,
+            }
         else:
             logger.info("No triggers found on %s", url)
 
     if all_matches:
-        total = sum(len(v) for v in all_matches.values())
+        total = sum(len(v["trigger_words"]) for v in all_matches.values())
         subject = f"Appellate Opinion Alert — {total} trigger(s) found on {len(all_matches)} site(s)"
         html_body = build_email_body(all_matches)
         send_email(
