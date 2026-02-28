@@ -2,9 +2,8 @@
 """
 Appellate Opinion Notification Tool
 
-Scrapes configured websites for trigger words using a headless browser
-(Playwright) to handle JavaScript-rendered content, and sends email
-notifications to a list of recipients when matches are found.
+Scrapes configured websites for trigger words — including content loaded
+inside iframes — and sends email notifications when matches are found.
 """
 
 import os
@@ -17,9 +16,10 @@ import argparse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,8 +33,12 @@ logger = logging.getLogger(__name__)
 
 GMAIL_SMTP_SERVER = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
-PAGE_LOAD_TIMEOUT = 60_000  # ms — generous for slow court sites
-NETWORK_IDLE_TIMEOUT = 15_000  # ms — wait for AJAX to finish
+REQUEST_TIMEOUT = 30
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def get_config():
@@ -73,20 +77,54 @@ def get_config():
     }
 
 
-def scrape_website(page, url):
-    """Navigate to a URL in the headless browser and return visible text."""
+def fetch_page(url):
+    """Fetch a single URL and return the parsed BeautifulSoup and raw text."""
+    response = requests.get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    return BeautifulSoup(response.text, "html.parser")
+
+
+def extract_text(soup):
+    """Extract visible text from a BeautifulSoup tree."""
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
+
+
+def scrape_website(url, depth=0):
+    """
+    Fetch a page, extract its text, and recursively follow iframes
+    (up to 2 levels deep) to capture all embedded content.
+    """
+    if depth > 2:
+        return ""
+
     logger.info("Scraping: %s", url)
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-        try:
-            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-        except PlaywrightTimeout:
-            logger.warning("Network-idle timeout on %s — proceeding with current content", url)
+        soup = fetch_page(url)
 
-        text = page.inner_text("body")
-        logger.info("Extracted %d characters from %s", len(text), url)
-        return text
-    except Exception as e:
+        iframe_texts = []
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "").strip()
+            if not src:
+                continue
+            iframe_url = urljoin(url, src)
+            logger.info("  Found iframe → %s", iframe_url)
+            iframe_text = scrape_website(iframe_url, depth=depth + 1)
+            if iframe_text:
+                iframe_texts.append(iframe_text)
+
+        page_text = extract_text(soup)
+        all_text = "\n".join([page_text] + iframe_texts)
+
+        logger.info("Extracted %d characters from %s (depth=%d)", len(all_text), url, depth)
+        return all_text
+
+    except requests.RequestException as e:
         logger.error("Failed to scrape %s: %s", url, e)
         return None
 
@@ -165,29 +203,16 @@ def run():
 
     all_matches = {}
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
-        page = context.new_page()
-
-        for url in config["websites"]:
-            text = scrape_website(page, url)
-            if text is None:
-                continue
-            matched = search_for_triggers(text, config["trigger_words"])
-            if matched:
-                logger.info("MATCH on %s — trigger(s): %s", url, ", ".join(matched))
-                all_matches[url] = matched
-            else:
-                logger.info("No triggers found on %s", url)
-
-        browser.close()
+    for url in config["websites"]:
+        text = scrape_website(url)
+        if not text:
+            continue
+        matched = search_for_triggers(text, config["trigger_words"])
+        if matched:
+            logger.info("MATCH on %s — trigger(s): %s", url, ", ".join(matched))
+            all_matches[url] = matched
+        else:
+            logger.info("No triggers found on %s", url)
 
     if all_matches:
         total = sum(len(v) for v in all_matches.values())
